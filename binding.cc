@@ -71,6 +71,7 @@ using j_hp_l2cap_connector_t = java_object_t<"to/holepunch/bare/bluetooth/L2capC
 using j_hp_l2cap_reader_t = java_object_t<"to/holepunch/bare/bluetooth/L2capReader">;
 using j_hp_scan_callback_t = java_object_t<"to/holepunch/bare/bluetooth/ScanCallback">;
 using j_hp_scan_helper_t = java_object_t<"to/holepunch/bare/bluetooth/ScanHelper">;
+using j_hp_state_receiver_t = java_object_t<"to/holepunch/bare/bluetooth/StateReceiver">;
 
 static uv_once_t bare_bluetooth_android__init_guard = UV_ONCE_INIT;
 
@@ -94,6 +95,29 @@ bare_bluetooth_android_get_context(JNIEnv *env) {
   auto cls = java_class_t<"android/app/ActivityThread">(env);
   auto current_app = cls.get_static_method<j_application_t()>("currentApplication");
   return j_context_t(env, current_app());
+}
+
+static inline java_global_ref_t<j_hp_state_receiver_t>
+bare_bluetooth_android_register_state_receiver(JNIEnv *env, uint64_t id, bool is_server) {
+  auto receiver_class = bare_bluetooth_android_get_class_loader(env).load_class<"to/holepunch/bare/bluetooth/StateReceiver">();
+  auto receiver = receiver_class(static_cast<long>(id), is_server);
+
+  auto register_receiver = receiver.get_class().get_method<void(j_context_t)>("register");
+  register_receiver(receiver, bare_bluetooth_android_get_context(env));
+
+  if (env->ExceptionCheck()) return {};
+
+  return java_global_ref_t<j_hp_state_receiver_t>(env, receiver);
+}
+
+static inline void
+bare_bluetooth_android_unregister_state_receiver(JNIEnv *env, java_global_ref_t<j_hp_state_receiver_t> &receiver) {
+  if (static_cast<jobject>(receiver) == nullptr) return;
+
+  auto unregister_receiver = receiver.get_class().get_method<void(j_context_t)>("unregister");
+  unregister_receiver(receiver, bare_bluetooth_android_get_context(env));
+
+  receiver = {};
 }
 
 template <java_class_name_t N>
@@ -195,6 +219,20 @@ bare_bluetooth_android_throw(js_env_t *env, JNIEnv *jenv) {
   bare_bluetooth_android_throw_error(env, to_string(error).c_str());
 }
 
+[[noreturn]] static inline void
+bare_bluetooth_android_throw_unregistering(js_env_t *env, JNIEnv *jenv, java_global_ref_t<j_hp_state_receiver_t> &receiver) {
+  auto error = j_throwable_t(jenv, jenv->ExceptionOccurred());
+
+  jenv->ExceptionClear();
+
+  auto message = error.get_class().get_method<std::string()>("toString")(error);
+
+  bare_bluetooth_android_unregister_state_receiver(jenv, receiver);
+  bare_bluetooth_android_check_exception(jenv);
+
+  bare_bluetooth_android_throw_error(env, message.c_str());
+}
+
 struct bare_bluetooth_android_peripheral_t;
 
 static std::unordered_map<uint64_t, bare_bluetooth_android_peripheral_t *> bare_bluetooth_android_peripherals;
@@ -291,6 +329,7 @@ struct bare_bluetooth_android_central_t {
   java_global_ref_t<j_bluetooth_le_scanner_t> scanner;
   java_global_ref_t<j_hp_scan_callback_t> scan_callback;
   java_global_ref_t<j_hp_gatt_callback_t> gatt_callback_ref;
+  java_global_ref_t<j_hp_state_receiver_t> state_receiver;
 
   // Stable id handed to the Java callbacks, resolved against the registry.
   uint64_t id;
@@ -298,6 +337,9 @@ struct bare_bluetooth_android_central_t {
   std::atomic<bool> destroyed;
   std::mutex connected_addresses_mutex;
   std::unordered_set<std::string> connected_addresses;
+
+  // Last adapter state queued to JS, guarded by the centrals mutex.
+  int32_t reported_state;
 
   std::atomic<int> refs;
 
@@ -460,6 +502,7 @@ struct bare_bluetooth_android_server_t {
   java_global_ref_t<j_bluetooth_gatt_server_t> gatt_server;
   java_global_ref_t<j_bluetooth_le_advertiser_t> advertiser;
   java_global_ref_t<j_advertise_callback_t> advertise_callback;
+  java_global_ref_t<j_hp_state_receiver_t> state_receiver;
 
   struct published_channel_t {
     java_global_ref_t<j_bluetooth_server_socket_t> server_socket;
@@ -471,6 +514,9 @@ struct bare_bluetooth_android_server_t {
   std::unordered_map<std::string, std::unordered_set<std::string>> subscriptions;
   std::unordered_set<std::string> connected_devices;
   std::unordered_map<std::string, java_global_ref_t<j_bluetooth_gatt_characteristic_t>> characteristics;
+
+  // Last adapter state queued to JS, guarded by the servers mutex.
+  int32_t reported_state;
 
   std::atomic<int> refs;
 
@@ -491,6 +537,21 @@ struct bare_bluetooth_android_server_ref_t {
 typedef struct {
   int32_t state;
 } bare_bluetooth_android_server_state_change_t;
+
+// Callers hold the owner's registry mutex, the same one the state receiver
+// posts under, so events reach JS in the order the states were read.
+template <typename T, typename E>
+static inline void
+bare_bluetooth_android_report_state(T *owner, int32_t state) {
+  if (owner->reported_state == state) return;
+  owner->reported_state = state;
+
+  auto *event = new E();
+  event->state = state;
+
+  owner->refs++;
+  js_call_threadsafe_function(owner->tsfn_state_change, event);
+}
 
 typedef struct {
   std::string uuid;
@@ -1351,6 +1412,7 @@ bare_bluetooth_android_central_init(
   central->destroyed = false;
   central->exiting = false;
   central->refs = 1;
+  central->reported_state = -1;
 
   {
     std::lock_guard<std::mutex> lock(bare_bluetooth_android_centrals_mutex);
@@ -1391,16 +1453,26 @@ bare_bluetooth_android_central_init(
 
   central->adapter = java_global_ref_t<j_bluetooth_adapter_t>(jenv, adapter_local);
 
-  auto get_state = central->adapter.get_class().get_method<int()>("getState");
-  int android_state = get_state(central->adapter);
+  // Registered before the snapshot below, so no transition can fall between them.
+  central->state_receiver = bare_bluetooth_android_register_state_receiver(jenv, central->id, false);
 
   if (bare_bluetooth_android_has_exception(jenv)) bare_bluetooth_android_throw(env, jenv);
 
-  auto *state_event = new bare_bluetooth_android_central_state_change_t();
-  state_event->state = android_state;
+  auto get_state = central->adapter.get_class().get_method<int()>("getState");
 
-  central->refs++;
-  js_call_threadsafe_function(central->tsfn_state_change, state_event);
+  {
+    std::lock_guard<std::mutex> lock(bare_bluetooth_android_centrals_mutex);
+
+    int android_state = get_state(central->adapter);
+
+    if (!bare_bluetooth_android_has_exception(jenv)) {
+      bare_bluetooth_android_report_state<bare_bluetooth_android_central_t, bare_bluetooth_android_central_state_change_t>(central, android_state);
+    }
+  }
+
+  if (bare_bluetooth_android_has_exception(jenv)) {
+    bare_bluetooth_android_throw_unregistering(env, jenv, central->state_receiver);
+  }
 
   js_external_t<bare_bluetooth_android_central_t> handle;
   err = js_create_external(env, central, handle);
@@ -1518,6 +1590,11 @@ bare_bluetooth_android_central_disconnect(
 
 static void
 bare_bluetooth_android_central_release(bare_bluetooth_android_central_t *central) {
+  auto jenv = bare_bluetooth_android_jvm().get_env().value();
+
+  bare_bluetooth_android_unregister_state_receiver(jenv, central->state_receiver);
+  bare_bluetooth_android_check_exception(jenv);
+
   int err = js_delete_reference(central->env, central->ctx);
   assert(err == 0);
 
@@ -3719,6 +3796,7 @@ bare_bluetooth_android_server_init(
   server->destroyed = false;
   server->exiting = false;
   server->refs = 1;
+  server->reported_state = -1;
 
   {
     std::lock_guard<std::mutex> lock(bare_bluetooth_android_servers_mutex);
@@ -3789,15 +3867,26 @@ bare_bluetooth_android_server_init(
   auto adapter = get_adapter(bt_manager);
   server->adapter = java_global_ref_t<j_bluetooth_adapter_t>(jenv, adapter);
 
-  auto get_state = adapter.get_class().get_method<int()>("getState");
-  int android_state = get_state(adapter);
+  // Registered before the snapshot below, so no transition can fall between them.
+  server->state_receiver = bare_bluetooth_android_register_state_receiver(jenv, server->id, true);
 
   if (bare_bluetooth_android_has_exception(jenv)) bare_bluetooth_android_throw(env, jenv);
 
-  auto *state_event = new bare_bluetooth_android_server_state_change_t();
-  state_event->state = android_state;
-  server->refs++;
-  js_call_threadsafe_function(server->tsfn_state_change, state_event);
+  auto get_state = adapter.get_class().get_method<int()>("getState");
+
+  {
+    std::lock_guard<std::mutex> lock(bare_bluetooth_android_servers_mutex);
+
+    int android_state = get_state(adapter);
+
+    if (!bare_bluetooth_android_has_exception(jenv)) {
+      bare_bluetooth_android_report_state<bare_bluetooth_android_server_t, bare_bluetooth_android_server_state_change_t>(server, android_state);
+    }
+  }
+
+  if (bare_bluetooth_android_has_exception(jenv)) {
+    bare_bluetooth_android_throw_unregistering(env, jenv, server->state_receiver);
+  }
 
   err = js_add_deferred_teardown_callback(env, bare_bluetooth_android_server__on_teardown, (void *) server, &server->teardown);
   assert(err == 0);
@@ -4121,6 +4210,9 @@ bare_bluetooth_android_server_release(bare_bluetooth_android_server_t *server) {
   int err;
 
   auto jenv = bare_bluetooth_android_jvm().get_env().value();
+
+  bare_bluetooth_android_unregister_state_receiver(jenv, server->state_receiver);
+  bare_bluetooth_android_check_exception(jenv);
 
   if (static_cast<jobject>(server->gatt_server) != nullptr) {
     auto gatt_server = j_bluetooth_gatt_server_t(jenv, server->gatt_server);
@@ -4543,6 +4635,29 @@ bare_bluetooth_android_on_notification_sent(
 }
 
 static void
+bare_bluetooth_android_on_state_change(
+  java_env_t env,
+  j_hp_state_receiver_t self,
+  long native_ptr,
+  bool is_server,
+  int state
+) {
+  if (is_server) {
+    std::lock_guard<std::mutex> lock(bare_bluetooth_android_servers_mutex);
+    auto *server = bare_bluetooth_android_find_server(static_cast<uint64_t>(native_ptr));
+    if (server == nullptr || server->exiting) return;
+
+    bare_bluetooth_android_report_state<bare_bluetooth_android_server_t, bare_bluetooth_android_server_state_change_t>(server, state);
+  } else {
+    std::lock_guard<std::mutex> lock(bare_bluetooth_android_centrals_mutex);
+    auto *central = bare_bluetooth_android_find_central(static_cast<uint64_t>(native_ptr));
+    if (central == nullptr || central->exiting) return;
+
+    bare_bluetooth_android_report_state<bare_bluetooth_android_central_t, bare_bluetooth_android_central_state_change_t>(central, state);
+  }
+}
+
+static void
 bare_bluetooth_android_register_natives() {
   auto jenv = bare_bluetooth_android_jvm().get_env().value();
   auto loader = bare_bluetooth_android_get_class_loader(jenv);
@@ -4611,6 +4726,13 @@ bare_bluetooth_android_register_natives() {
     cls.register_natives(
       java_native_method_t<bare_bluetooth_android_on_l2cap_acceptor_accepted>("nativeOnAccepted"),
       java_native_method_t<bare_bluetooth_android_on_l2cap_acceptor_error>("nativeOnError")
+    );
+  }
+
+  {
+    auto cls = loader.load_class<"to/holepunch/bare/bluetooth/StateReceiver">();
+    cls.register_natives(
+      java_native_method_t<bare_bluetooth_android_on_state_change>("nativeOnStateChange")
     );
   }
 }

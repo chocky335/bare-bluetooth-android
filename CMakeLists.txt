@@ -51,6 +51,7 @@ add_dex(
     lib/L2capAcceptor.java
     lib/ErrorHelper.java
     lib/ThreadHelper.java
+    lib/StateReceiver.java
   INCLUDE_JARS
     ${android_jar}
 )
